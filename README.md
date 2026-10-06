@@ -58,6 +58,18 @@
   不因计算改变位姿、关系或历史，也不产生新快照。缺少陶片、重复陶片对、
   跨版本或无效编号时整次拒绝并逐字段指出。间隙为零表示接触，负值（-1）
   仅用于标识重叠，不得当作可用间隙。
+- **补配区域评估**：修复师在**任一装配版本**（当前版或历史版）中选一片
+  作**组锚**，并直接绘制世界坐标毫米制的**目标器形闭合轮廓**；系统依据
+  该版快照取锚片所在连通组（孤片按单片），按该版轮廓与位姿放置组内全部
+  陶片，**先逐片裁入目标范围**（超出目标的部分不计）、**再取几何并集**
+  （片间重叠只计一次），**目标减去并集得到缺口**。返回目标面积、已覆盖
+  面积、缺口总面积，以及每个正面积缺口的外边界、内孔边界与面积；缺口按
+  面积降序、面积相同时按中心坐标排序，仅共点（无公共边/面积）的缺口不
+  合并；目标范围内独立的已覆盖岛表现为缺口多边形的内孔，孔洞拓扑保留。
+  页面在历史装配上以绿色标覆盖、红色标缺口（虚线内孔）、棕色标目标轮廓。
+  全程只读，不改变装配、关系与快照，不产生新版本；目标轮廓自交/面积为
+  零、坐标非有限数、锚片编号非法、版本快照或锚片在该版不存在均整次拒绝
+  并指出原因；无正面积缺口时返回空清单与零面积。
 - **不可改版本快照与历史恢复**：录入/删除碎片、采纳/撤销拼接、试拼确认、
   轮廓修订确认、锚点整体校准确认每次成功都与装配数据在**同一事务**内固化
   一条版本快照（碎片轮廓与位姿、有效及已撤销关系、连通组），快照一经写入
@@ -231,6 +243,7 @@ curl -X DELETE 'http://localhost:8000/api/fragments/5?expected_version=2'
 | `GET` | `/api/assembly/versions` | 历史版本清单（版本/来源/快照时间，新版本在前） |
 | `GET` | `/api/assembly/versions/{v}` | 只读查看历史版完整装配（轮廓/位姿/有效及已撤销关系/连通组） |
 | `POST` | `/api/assembly/versions/{v}/gaps` | 陶片对间隙查询：按该版快照计算每对边界最短间隙/最近点/是否重叠（只读） |
+| `POST` | `/api/assembly/versions/{v}/repair-assessment` | 补配区域评估：按组锚与世界坐标目标轮廓计算目标/已覆盖/缺口面积及逐个缺口边界（只读） |
 | `POST` | `/api/assembly/versions/{v}/restore/preview` | 恢复预览：恢复后完整装配 + 与当前版碎片/关系差异（不落库） |
 | `POST` | `/api/assembly/versions/{v}/restore/confirm` | 确认恢复（原子恢复原 ID 与状态、重算连通组，版本只 +1，留新快照） |
 | `POST` | `/api/trials/rehearse` | 有序试拼预演（不落库） |
@@ -249,9 +262,13 @@ curl -X DELETE 'http://localhost:8000/api/fragments/5?expected_version=2'
 同片成对 / 重复陶片对 / 跨版本**），`404` 对象不存在（碎片、关系、
 **目标版本快照**、**锚点碎片**缺失；版本恢复时
 `detail.code=version_not_found`，校准时 `detail.code=fragment_not_found`，
-**间隙查询时 `detail.code=fragment_not_found` 并逐字段指出缺失陶片**），
+**间隙查询时 `detail.code=fragment_not_found` 并逐字段指出缺失陶片，
+补配评估时 `detail.code=anchor_not_found`（锚片在该版不存在）**），
 `409` 版本冲突或重复撤销（含恢复预览/确认、**校准预览/确认**、**导入确认**的期望版本
-过期），`422` 请求体结构不合法。迁移包本身的结构 / 轮廓 / 引用 / 快照版本
+过期），`422` 请求体结构不合法。补配评估的 `400` 代码为
+`invalid_anchor`（锚片编号非正整数）、`non_finite_coordinate`（目标轮廓
+含 NaN/Infinity，逐顶点字段指出）、`invalid_target_contour`（顶点不足 /
+面积为零 / 自交）。迁移包本身的结构 / 轮廓 / 引用 / 快照版本
 / 末版一致性问题为 `400`（`detail.code` 见「离线工作站迁移 API」的整包拒绝
 表，全部原因列于 `detail.reasons[]`）；目标库非空白为
 `400 target_not_blank`，预览端点对非空白目标返回 `200` 且 `ok=false`。
@@ -896,22 +913,171 @@ curl -X POST http://localhost:8000/api/assembly/versions/2/gaps \
 #   {"field":"pairs[3].version","code":"cross_version", ...}]}}
 ```
 
+## 补配区域评估 API
+
+修复师在**任一装配版本**（当前版或任意历史版）中：
+
+1. 选一片陶片作**组锚** —— 系统取该版本快照中锚片所在**连通组**的全部
+   陶片（快照 `group_id` 相同者；孤片 `group_id=null` 按单片一组）；
+2. 直接在**世界坐标（毫米）**绘制**目标器形闭合轮廓** `target_contour`
+   （即待补配的器形范围，≥3 个有限数值顶点，闭合时自动重复末点）。
+
+系统按**该版本快照固化的轮廓与位姿**（仅平移+旋转，无缩放/镜像）放置
+组内全部陶片：
+
+- **先裁入目标范围**：每片世界轮廓与目标区域求交 —— 碎片超出目标的
+  部分不计入已覆盖；
+- **再取几何并集**：裁剪结果做并集 —— 组内片间重叠区域只计一次覆盖；
+- **目标减去并集得到缺口**：`缺口 = 目标 − 已覆盖并集`。
+
+**拓扑规则**：目标范围内**独立的已覆盖岛**使缺口多边形带上对应**内孔**
+（`holes` 保留孔洞拓扑）；两个缺口**仅共点**（无公共边/面积）时**不
+合并**，各自列为一条正面积缺口。缺口按 `area_mm2` **降序**排列，面积
+相同时按中心（centroid）坐标 `x`、再 `y` **升序**。目标被完全覆盖时
+`gap_count=0`、`gap_area_mm2=0`、`gaps=[]`。
+
+**只读保证**：仅读取指定版本的不可改快照，不修改当前装配、位姿、关系
+或历史，也不产生新版本快照；当前版与任意历史版均可评估。
+
+### 请求
+
+```
+POST /api/assembly/versions/{version}/repair-assessment
+```
+
+```jsonc
+{
+  "anchor_id": 1,                       // 组锚碎片 id（须存在于该版本快照）
+  "target_contour": [                   // 世界坐标、毫米制、闭合轮廓
+    [0, 0], [100, 0], [100, 70], [0, 70]
+  ]
+}
+```
+
+### 调用示例
+
+```bash
+curl -X POST http://localhost:8000/api/assembly/versions/2/repair-assessment \
+  -H 'Content-Type: application/json' \
+  -d '{"anchor_id": 1,
+       "target_contour": [[0,0],[100,0],[100,70],[0,70]]}'
+```
+
+响应（演示数据 v2：#1/#2 已共边拼接成组，A+B 覆盖 4800 mm²，目标
+7000 mm²，右侧为单一缺口 2200 mm²）：
+
+```jsonc
+{
+  "ok": true,
+  "version": 2,
+  "source": "accept",
+  "source_label": "采纳拼接",
+  "snapshot_created_at": "2026-10-06T00:41:27+00:00",
+  "current_version": 3,
+  "historical": true,                    // 可在历史版上评估
+  "anchor": { "id": 1, "name": "陶片A-左半" },
+  "group": { "id": 1, "fragment_ids": [1, 2] },
+  "independent": false,                  // true 时 group=null，只评估锚片
+  "fragment_count": 2,
+  "fragment_ids": [1, 2],
+  "target_contour": [[0.0,0.0],[100.0,0.0],[100.0,70.0],[0.0,70.0]],
+  "target_area_mm2": 7000.0,
+  "covered_area_mm2": 4800.0,            // 先裁剪再并集：超出不计、重叠一次
+  "gap_area_mm2": 2200.0,                // = 各正面积缺口面积之和
+  "gap_count": 1,
+  "gaps": [
+    {
+      "index": 1,                        // 面积降序（并列按中心 x、y 升序）
+      "area_mm2": 2200.0,
+      "center_mm": [71.8182, 45.9091],   // 缺口中心（世界坐标，毫米）
+      "outer_boundary": [[80.0,0.0], [100.0,0.0], /* ... 闭合环，无重复末点 */],
+      "holes": [],                       // 内孔边界；覆盖岛使缺口带孔时非空
+      "hole_count": 0
+    }
+  ],
+  "coverage_polygons": [                 // 已覆盖并集多边形（外边界+内孔）
+    { "outer_boundary": [/* ... */], "holes": [], "area_mm2": 4800.0 }
+  ],
+  "placed_fragments": [                  // 组内各片按该版位姿放置后的世界轮廓
+    { "fragment_id": 1, "name": "陶片A-左半", "clipped_area_mm2": 2205.0,
+      "contour_world": [[0.0,0.0], /* ... */] },
+    { "fragment_id": 2, "name": "陶片B-右半", "clipped_area_mm2": 2595.0,
+      "contour_world": [[35.0,0.0], /* ... */] }
+  ]
+}
+```
+
+完全覆盖（无正面积缺口）：
+
+```jsonc
+{ "target_area_mm2": 900.0, "covered_area_mm2": 900.0,
+  "gap_area_mm2": 0.0, "gap_count": 0, "gaps": [],
+  "coverage_polygons": [/* … */], "placed_fragments": [/* … */] }
+```
+
+独立覆盖岛（目标内孤片周围全是缺口，岛成为缺口的内孔）：
+
+```jsonc
+"gaps": [{ "index": 1, "area_mm2": 99.0,
+           "outer_boundary": [/* 目标外环 */],
+           "hole_count": 1,
+           "holes": [[[2.0,2.0],[3.0,2.0],[3.0,3.0],[2.0,3.0]]] }]
+```
+
+### 页面用法
+
+- **当前版**：在「查看装配」页找到「补配区域评估」卡片，点「开始补配
+  评估」；
+- **历史版**：在历史版本清单对任一版本点「查看」，侧栏底部同样提供
+  「补配区域评估（历史版 vN）」卡片。
+
+选择组锚碎片后在主画布单击绘制世界坐标毫米目标轮廓（也可粘贴 JSON
+载入），点「评估（只读）」。画布以棕色实线标目标轮廓、绿色半透明标已
+覆盖并集、红色标缺口并编号注明面积；缺口的虚线内边界即目标范围内的独立
+已覆盖岛。评估不改任何数据，可反复改锚片 / 轮廓重新评估。
+
+### 整次拒绝（不执行任何计算）
+
+- `400 invalid_anchor`：锚片编号非正整数（`field=anchor_id`）；
+- `400 non_finite_coordinate`：目标轮廓含 `NaN` / `±Infinity`，
+  `detail.errors[]` 逐顶点指出（字段如 `target_contour[2].x`）；
+- `400 invalid_target_contour`：顶点格式非法、有效顶点不足 3 个、
+  面积为零（共线）或轮廓自交（`field=target_contour` 或
+  `target_contour[i]`）；
+- `404 anchor_not_found`：锚片在该版本快照中不存在（含「锚片存在于
+  当前版但历史版尚未录入」的情形）；
+- `404 version_not_found`：目标版本快照不存在；
+- `422`：请求体结构不合法（如 `anchor_id` 为字符串、顶点少于 3 个）。
+
+```bash
+# 自交（蝴蝶结）轮廓 + 不存在的锚片演示：
+curl -X POST http://localhost:8000/api/assembly/versions/2/repair-assessment \
+  -H 'Content-Type: application/json' \
+  -d '{"anchor_id": 1,
+       "target_contour": [[0,0],[10,10],[10,0],[0,10]]}'
+# 400 {"detail":{"code":"invalid_target_contour","errors":[
+#   {"field":"target_contour","code":"invalid_target_contour",
+#    "message":"轮廓自交：…"}]}}
+```
+
 ## 项目结构
 
 ```
 app/
-  main.py          # FastAPI 路由、单条拼接、版本控制、试拼/修订/校准/历史恢复/间隙查询/离线迁移端点
+  main.py          # FastAPI 路由、单条拼接、版本控制、试拼/修订/校准/历史恢复/间隙查询/补配评估/离线迁移端点
   history.py       # 历史版本：来源标签、连通组重算、碎片/关系差异演算（只读）
   portable.py      # 离线工作站迁移：JSON 包导出、整包校验、导入预览演算（只读）
   revision.py      # 轮廓修订：边缘标记校验、受影响组误差/碰撞演算（只读）
   calibration.py   # 锚点整体校准：固定锚点的组内刚体最小二乘、误差/碰撞演算（只读）
   gaps.py          # 陶片对间隙查询：版本快照上的边界最短间隙/最近点/重叠演算（只读）
+  repair.py        # 补配区域评估：组锚连通组按版位姿裁剪并集、缺口孔洞拓扑演算（只读）
   trial.py         # 有序试拼：内存快照逐步推演 + 整组提交 + 位姿演算
   geometry.py      # 刚体配准（最小二乘）、轮廓/边缘标记校验、重叠检测
   database.py      # SQLite 持久化、连通组重算、不可改版本快照、按版恢复、迁移包整包导入
   static/          # 浏览器二维画布前端（原生 JS）
 tests/
   test_gaps.py     # 陶片对间隙查询 API 测试
+  test_repair.py   # 补配区域评估 API/纯演算（孔洞、仅共点、排序、裁剪、只读、拒绝）测试
   test_transfer.py # 离线工作站迁移（导出/预览/确认/整包拒绝/空白约束/409）测试
 Dockerfile
 docker-compose.yml
