@@ -17,7 +17,9 @@ const S = {
   calibrate: null,
   trial: { steps: [], rehearsal: null, busy: false },
   // 历史版本：versions 版本清单；view 只读查看的历史版；restore 恢复预览
-  history: { versions: [], view: null, restore: null, busy: false },
+  history: { versions: [], view: null, restore: null, busy: false,
+             // 补配区域评估会话：{points, result, busy, anchorId}
+             repair: null },
   // 离线工作站迁移：preview 导入预览（未确认，不写库）；busy 预览/确认中
   transfer: { preview: null, busy: false, fileName: '' },
   camInit: false,
@@ -72,6 +74,7 @@ async function loadAssembly() {
   S.calibrate = null;                                     // 刷新后旧校准会话作废
   S.history.view = null;
   S.history.restore = null;
+  S.history.repair = null;
   S.transfer = { preview: null, busy: false, fileName: '' };
   $('#versionBadge').textContent = `版本 v${S.version}`;
   renderPanel();
@@ -103,6 +106,7 @@ async function loadVersions() {
 function closeHistory() {
   S.history.view = null;
   S.history.restore = null;
+  S.history.repair = null;
   renderPanel();
   renderMain();
 }
@@ -114,6 +118,7 @@ async function viewVersion(v) {
     const data = await api(`/api/assembly/versions/${v}`);
     S.history.view = data;
     S.history.restore = null;
+    S.history.repair = null;
     renderPanel();
     renderMain();
   } catch (err) {
@@ -121,6 +126,55 @@ async function viewVersion(v) {
   } finally {
     S.history.busy = false;
     renderPanel();
+  }
+}
+
+// ---------------------------------------------------------------- 补配区域评估
+function startRepairAssessment() {
+  const hv = S.history.view;
+  if (!hv) return;
+  const a = hv.assembly;
+  const anchorId = a.fragments[0]?.id ?? null;
+  S.history.repair = { points: [], result: null, busy: false, anchorId };
+  renderPanel(); renderMain();
+}
+
+function closeRepairAssessment() {
+  S.history.repair = null;
+  renderPanel(); renderMain();
+}
+
+function repairAddPoint(wx, wy) {
+  const R = S.history.repair;
+  if (!R) return;
+  R.points.push([+wx.toFixed(3), +wy.toFixed(3)]);
+  R.result = null;   // 目标轮廓一变，旧评估结果失效
+  renderPanel(); renderMain();
+}
+
+async function assessRepairRegion() {
+  const hv = S.history.view;
+  const R = S.history.repair;
+  if (!hv || !R || R.points.length < 3) return;
+  R.busy = true; R.result = null;
+  renderPanel();
+  try {
+    R.result = await api(
+      `/api/assembly/versions/${hv.version}/repair-region`, {
+        method: 'POST',
+        body: JSON.stringify({
+          anchor_fragment_id: R.anchorId,
+          target_contour: R.points,
+        }),
+      });
+    setMessage(`补配区域评估完成：目标 ${fmt(R.result.target_area_mm2)} mm²，`
+      + `已覆盖 ${fmt(R.result.covered_area_mm2)} mm²，`
+      + `缺口 ${fmt(R.result.gap_total_area_mm2)} mm²（${R.result.gap_count} 处）`);
+  } catch (err) {
+    setMessage(detailText(err.detail), 'err');
+  } finally {
+    R.busy = false;
+    renderPanel(); renderMain();
   }
 }
 
@@ -374,6 +428,62 @@ function drawMarkerPair(wa, wb, idx, errText, color = '#c0392b') {
   ctx.fillText(`#${idx + 1}${errText || ''}`, (ax + bx) / 2 + 5, (ay + by) / 2 - 4);
 }
 
+function drawRepairOverlay() {
+  const R = S.mode === 'view' ? S.history.repair : null;
+  if (!R) return;
+  // 评估结果：缺口红色半透明填充 + 红边 + 编号/面积；内孔边界深红虚线
+  if (R.result) {
+    for (const g of R.result.gaps) {
+      const path = pathOf(g.exterior);
+      ctx.globalAlpha = 0.28;
+      ctx.fillStyle = '#c0392b';
+      ctx.fill(path);
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = '#a93226';
+      ctx.lineWidth = 2;
+      ctx.stroke(path);
+      for (const h of g.holes) {
+        const hp = pathOf(h);
+        ctx.setLineDash([5, 3]);
+        ctx.strokeStyle = '#7b241c';
+        ctx.lineWidth = 1.5;
+        ctx.stroke(hp);
+        ctx.setLineDash([]);
+      }
+      const [sx, sy] = toScreen(g.centroid[0], g.centroid[1]);
+      ctx.fillStyle = '#7b241c';
+      ctx.font = 'bold 12px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(`缺${g.index} · ${fmt(g.area_mm2, 1)} mm²`, sx, sy);
+      ctx.textAlign = 'left';
+    }
+    // 目标轮廓：绿粗边（仅描边，不遮挡缺口填色）
+    const tp = pathOf(R.result.target_contour);
+    ctx.strokeStyle = '#1e8449';
+    ctx.lineWidth = 2.5;
+    ctx.stroke(tp);
+  }
+  // 编辑中的目标轮廓（棕橙）+ 顶点编号
+  if (R.points.length) {
+    ctx.beginPath();
+    R.points.forEach((p, i) => {
+      const [sx, sy] = toScreen(p[0], p[1]);
+      i === 0 ? ctx.moveTo(sx, sy) : ctx.lineTo(sx, sy);
+    });
+    if (R.points.length >= 3) ctx.closePath();
+    ctx.strokeStyle = '#c89b5a';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    R.points.forEach((p, i) => {
+      const [sx, sy] = toScreen(p[0], p[1]);
+      ctx.fillStyle = '#c89b5a';
+      ctx.beginPath(); ctx.arc(sx, sy, 3.5, 0, 7); ctx.fill();
+      ctx.fillStyle = '#6b5433'; ctx.font = '10px sans-serif';
+      ctx.fillText(`${i + 1}`, sx + 5, sy - 5);
+    });
+  }
+}
+
 function renderMain() {
   const [w, h] = resizeCanvas();
   ctx.clearRect(0, 0, w, h);
@@ -469,9 +579,11 @@ function renderMain() {
     }
   }
 
+  // 补配区域评估：目标器形轮廓（棕橙）+ 缺口（红色填充描边，编号标注）
+  drawRepairOverlay();
+
   // 录入中的多边形
-  if (S.mode === 'draw' && S.draw.points.length) {
-    const pts = S.draw.points;
+  if (S.mode === 'draw' && S.draw.points.length) {    const pts = S.draw.points;
     ctx.beginPath();
     pts.forEach((p, i) => {
       const [sx, sy] = toScreen(p[0], p[1]);
@@ -513,7 +625,11 @@ function renderPanel() {
         : S.history.restore
       ? `恢复预览：恢复到 v${S.history.restore.target_version} 后的完整装配（蓝色，未改当前数据）· 侧栏可核对碎片/关系差异并确认恢复 · 拖拽平移 · 滚轮缩放`
       : S.history.view
-        ? `历史版本 v${S.history.view.version} 只读查看（紫色，未改当前数据）· 碎片轮廓/位姿/连通组/有效及已撤销关系 · 拖拽平移 · 滚轮缩放`
+        ? (S.history.repair
+          ? (S.history.repair.result
+            ? `补配区域评估（v${S.history.view.version}，只读）：绿色为目标器形轮廓，红色区域为缺口（深红虚线为内孔/已覆盖岛）· 单击可继续添加目标顶点 · 拖拽平移 · 滚轮缩放`
+            : `补配区域评估（v${S.history.view.version}，只读）：在主画布单击绘制世界坐标毫米制目标器形闭合轮廓（≥3 顶点），完成后点「评估」· 拖拽平移 · 滚轮缩放`)
+          : `历史版本 v${S.history.view.version} 只读查看（紫色，未改当前数据）· 碎片轮廓/位姿/连通组/有效及已撤销关系 · 可发起补配区域评估 · 拖拽平移 · 滚轮缩放`)
         : trialAssembly()
           ? '有序试拼预演结果（蓝色，不落库）· 侧栏可确认整组提交 · 拖拽平移 · 滚轮缩放'
           : '拖拽平移 · 滚轮缩放 · 单位：毫米',
@@ -851,6 +967,57 @@ function historyRelCards(asm) {
     </div>`).join('') || '<div class="small">该版本无任何关系。</div>';
 }
 
+function repairPanelHTML() {
+  const hv = S.history.view;
+  const R = S.history.repair;
+  const a = hv.assembly;
+  const anchorOpts = a.fragments.map(f =>
+    `<option value="${f.id}" ${f.id === R.anchorId ? 'selected' : ''}>#${f.id} ${esc(f.name)}</option>`).join('');
+  const pts = R.points.map((p, i) =>
+    `<div class="small mono">${i + 1}. (${fmt(p[0])}, ${fmt(p[1])})</div>`).join('');
+  let resultHTML = '';
+  if (R.result) {
+    const d = R.result;
+    const rows = d.gaps.map(g => `
+      <tr><td>${g.index}</td><td>${fmt(g.area_mm2, 2)}</td>
+        <td>(${fmt(g.centroid[0])}, ${fmt(g.centroid[1])})</td>
+        <td>${g.exterior.length}</td><td>${g.hole_count}</td></tr>`).join('');
+    resultHTML = `
+      <div class="okbox">✓ 评估完成（只读，未改装配/关系/快照）：目标
+        <b>${fmt(d.target_area_mm2, 2)}</b> mm² · 已覆盖
+        <b>${fmt(d.covered_area_mm2, 2)}</b> mm² · 缺口总面积
+        <b>${fmt(d.gap_total_area_mm2, 2)}</b> mm²（${d.gap_count} 处）。
+        组内碎片：${d.group_fragment_ids.join(', ')}${d.independent ? '（孤片按单片）' : ''}。</div>
+      ${d.gap_count
+        ? `<table class="info"><tr><th>#</th><th>面积 mm²</th><th>中心 (mm)</th><th>外边顶点</th><th>内孔</th></tr>${rows}</table>`
+        : '<div class="small">无正面积缺口（缺口清单为空、缺口总面积为 0）。</div>'}`;
+  }
+  return `
+    <h2>补配区域评估</h2>
+    <div class="small">在该历史版（v${hv.version}）选一片作<b>组锚</b>，在主画布单击
+      绘制<b>世界坐标毫米制目标器形闭合轮廓</b>；系统按该版轮廓与位姿放置锚片所在
+      连通组全部陶片（孤片按单片），先裁入目标再取并集（超出部分不计、重叠只扣
+      一次），目标减去并集得到缺口。仅共点的缺口不合并，按面积降序、中心坐标
+      排序；独立已覆盖岛保留为缺口内孔。</div>
+    <label class="lab">组锚（所在连通组全部陶片参与）</label>
+    <select id="selRepairAnchor">${anchorOpts}</select>
+    <label class="lab">目标轮廓顶点（${R.points.length} 个，世界坐标毫米）</label>
+    <div style="max-height:150px;overflow:auto">${pts || '<div class="small">在主画布上单击添加顶点（≥3 个）</div>'}</div>
+    <div class="row">
+      <button class="act" id="btnRepairUndo" ${R.points.length ? '' : 'disabled'}>撤销顶点</button>
+      <button class="act" id="btnRepairClear" ${R.points.length ? '' : 'disabled'}>清空</button>
+    </div>
+    <textarea id="repairJson" rows="3" placeholder='粘贴目标轮廓 JSON，如 [[0,0],[90,0],[90,60],[0,60]]'></textarea>
+    <div class="row"><button class="act" id="btnRepairLoadJson">载入坐标</button></div>
+    <div class="row" style="margin-top:8px">
+      <button class="act primary" id="btnRepairRun"
+        ${R.points.length >= 3 && !R.busy ? '' : 'disabled'}>
+        ${R.busy ? '评估中…' : '评估补配缺口'}</button>
+      <button class="act danger" id="btnRepairClose">退出评估</button>
+    </div>
+    ${resultHTML}`;
+}
+
 function historyViewPanelHTML() {
   const hv = S.history.view;
   const a = hv.assembly;
@@ -859,9 +1026,13 @@ function historyViewPanelHTML() {
       （${esc(hv.source_label)}）— 当前数据未改变。</div>
     <div class="row" style="margin:6px 0">
       <button class="act" id="btnHistBack">返回当前装配</button>
+      ${S.history.repair
+        ? ''
+        : `<button class="act primary" id="btnRepairStart">补配区域评估</button>`}
       ${hv.version === S.version ? ''
-        : `<button class="act primary" id="btnHistRestore" ${S.history.busy ? 'disabled' : ''}>恢复到此版本…</button>`}
+        : `<button class="act" id="btnHistRestore" ${S.history.busy ? 'disabled' : ''}>恢复到此版本…</button>`}
     </div>
+    ${S.history.repair ? repairPanelHTML() : ''}
     <h2>连通组</h2><div class="small">${esc(groupText(a.groups))}</div>
     <h2>碎片（${a.fragments.length}）</h2>${historyFragCards(a)}
     <h2>关系（${a.relations.length}，含已撤销）</h2>${historyRelCards(a)}`;
@@ -1145,6 +1316,40 @@ function bindPanelEvents() {
   if (btnHistBack) btnHistBack.onclick = closeHistory;
   const btnHistRestore = document.getElementById('btnHistRestore');
   if (btnHistRestore) btnHistRestore.onclick = () => previewRestore(S.history.view.version);
+  const btnRepairStart = document.getElementById('btnRepairStart');
+  if (btnRepairStart) btnRepairStart.onclick = startRepairAssessment;
+  const btnRepairClose = document.getElementById('btnRepairClose');
+  if (btnRepairClose) btnRepairClose.onclick = closeRepairAssessment;
+  const btnRepairRun = document.getElementById('btnRepairRun');
+  if (btnRepairRun) btnRepairRun.onclick = assessRepairRegion;
+  const btnRepairUndo = document.getElementById('btnRepairUndo');
+  if (btnRepairUndo) btnRepairUndo.onclick = () => {
+    S.history.repair.points.pop();
+    S.history.repair.result = null;
+    renderPanel(); renderMain();
+  };
+  const btnRepairClear = document.getElementById('btnRepairClear');
+  if (btnRepairClear) btnRepairClear.onclick = () => {
+    S.history.repair.points = [];
+    S.history.repair.result = null;
+    renderPanel(); renderMain();
+  };
+  const selRepairAnchor = document.getElementById('selRepairAnchor');
+  if (selRepairAnchor) selRepairAnchor.onchange = e => {
+    S.history.repair.anchorId = +e.target.value;
+    S.history.repair.result = null;
+    renderPanel(); renderMain();
+  };
+  const btnRepairLoadJson = document.getElementById('btnRepairLoadJson');
+  if (btnRepairLoadJson) btnRepairLoadJson.onclick = () => {
+    try {
+      const arr = JSON.parse($('#repairJson').value);
+      if (!Array.isArray(arr) || arr.some(p => !Array.isArray(p) || p.length < 2)) throw 0;
+      S.history.repair.points = arr.map(p => [+p[0], +p[1]]);
+      S.history.repair.result = null;
+      renderPanel(); renderMain();
+    } catch { setMessage('坐标 JSON 格式不正确', 'err'); }
+  };
   const btnHistConfirm = document.getElementById('btnHistConfirm');
   if (btnHistConfirm) btnHistConfirm.onclick = confirmRestore;
   const btnClear = document.getElementById('btnTrialClear');
@@ -1465,6 +1670,7 @@ function applyAssembly(a) {
   S.relations = a.relations;
   S.history.view = null;
   S.history.restore = null;
+  S.history.repair = null;
   S.calibrate = null;
   $('#versionBadge').textContent = `版本 v${S.version}`;
   renderPanel(); renderMain();
@@ -1621,6 +1827,11 @@ canvas.addEventListener('mouseup', e => {
     S.revise.preview = null;   // 轮廓一变，旧预览失效
     renderPanel(); renderMain();
   }
+  if (wasClick && S.mode === 'view' && S.history.view && S.history.repair) {
+    // 补配评估：在历史版主画布上单击添加目标器形顶点（世界坐标，毫米制）
+    const [wx, wy] = toWorld(e.offsetX, e.offsetY);
+    repairAddPoint(wx, wy);
+  }
 });
 canvas.addEventListener('mouseleave', () => { drag = null; });
 canvas.addEventListener('wheel', e => {
@@ -1637,7 +1848,7 @@ canvas.addEventListener('wheel', e => {
 function switchMode(mode) {
   if (S.mode === 'revise' && mode !== 'revise') S.revise = null;  // 离开修订页即结束会话
   if (S.mode === 'view' && mode !== 'view') S.calibrate = null;   // 离开查看页即结束校准会话
-  if (mode !== 'view') { S.history.view = null; S.history.restore = null; }
+  if (mode !== 'view') { S.history.view = null; S.history.restore = null; S.history.repair = null; }
   S.mode = mode;
   document.querySelectorAll('.mode-btn').forEach(b =>
     b.classList.toggle('active', b.dataset.mode === mode));

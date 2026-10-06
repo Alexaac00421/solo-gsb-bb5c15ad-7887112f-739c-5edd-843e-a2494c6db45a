@@ -58,6 +58,17 @@
   不因计算改变位姿、关系或历史，也不产生新快照。缺少陶片、重复陶片对、
   跨版本或无效编号时整次拒绝并逐字段指出。间隙为零表示接触，负值（-1）
   仅用于标识重叠，不得当作可用间隙。
+- **补配区域评估**：修复师在**任一装配版本**选一片作**组锚**，并在主
+  画布绘制（或粘贴 JSON）**世界坐标毫米制的目标器形闭合轮廓**；系统按
+  所选版本的轮廓与位姿放置锚片所在**连通组**的全部陶片（孤片按单片
+  计算），**先裁入目标范围，再取几何并集**——碎片超出目标的部分不计、
+  组内重叠部分只扣一次；目标减去并集得到缺口。返回目标面积、已覆盖
+  面积、缺口总面积，以及每个正面积缺口的**外边界、内孔边界与面积**
+  （仅共点的缺口不合并，按面积降序及中心坐标排序）；目标范围内独立的
+  已覆盖岛保留为缺口内孔（孔洞拓扑）。目标轮廓自交、锚片在该版不存在
+  或坐标非有限数（NaN / Infinity）时整次拒绝并指出原因；无正面积缺口
+  返回空清单与零面积。评估**只读**：不改变当前装配、关系与快照，页面
+  在历史装配上以红/绿标出缺口与目标轮廓。
 - **不可改版本快照与历史恢复**：录入/删除碎片、采纳/撤销拼接、试拼确认、
   轮廓修订确认、锚点整体校准确认每次成功都与装配数据在**同一事务**内固化
   一条版本快照（碎片轮廓与位姿、有效及已撤销关系、连通组），快照一经写入
@@ -198,7 +209,24 @@ curl -X DELETE 'http://localhost:8000/api/fragments/5?expected_version=2'
    - 不满足任一条件（误差未严格下降 / 仍有超限 / 产生轮廓重叠）则说明原因、
      保持现状；预览依据版本过期时按钮禁用，重新预览后再确认；校准前后两个
      版本都会出现在底部「历史版本」列表，可查看或恢复。
-10. **离线工作站迁移**（导出包 → 空白工作站预览 → 确认导入）：
+10. **补配区域评估**（任一历史版本，只读）：
+    - 在「查看装配」页底部「**历史版本**」点「**查看**」进入任一版本的
+      只读页面，点「**补配区域评估**」；
+    - 选择该版中的一片陶片作**组锚**（孤片按单片计算），在主画布单击
+      绘制**世界坐标毫米制的目标器形闭合轮廓**（≥3 顶点，可粘贴 JSON /
+      撤销 / 清空），点「**评估补配缺口**」；
+    - 组内全部陶片按该版轮廓与位姿放置，**先裁入目标范围再取几何并集**
+      （超出目标部分不计、重叠只扣一次），目标减去并集得到缺口；主画布
+      以**绿色粗边**显示目标轮廓，**红色半透明**逐块标出正面积缺口并
+      标注编号与面积，**深红虚线**标出缺口内孔（目标范围内独立的已覆盖
+      岛保留孔洞拓扑）；
+    - 侧栏给出目标面积、已覆盖面积、缺口总面积与缺口清单（面积、中心
+      坐标、外边顶点数、内孔数）；仅共点的缺口不合并，按面积降序、中心
+      坐标排序；无正面积缺口时清单为空、缺口总面积为 0；
+    - 目标轮廓自交 / 坐标非有限数 / 锚片在该版本不存在时整次拒绝并指出
+      原因；评估全程**只读**，不改变当前装配、关系与快照，可退出后继续
+      其它操作。
+11. **离线工作站迁移**（导出包 → 空白工作站预览 → 确认导入）：
     - 在「查看装配」页底部「**离线工作站迁移**」点「**导出当前装配包
       （JSON）**」，下载带格式版本号的迁移包（含当前装配与全部不可改
       快照）；此操作只读，不改任何数据；
@@ -231,6 +259,7 @@ curl -X DELETE 'http://localhost:8000/api/fragments/5?expected_version=2'
 | `GET` | `/api/assembly/versions` | 历史版本清单（版本/来源/快照时间，新版本在前） |
 | `GET` | `/api/assembly/versions/{v}` | 只读查看历史版完整装配（轮廓/位姿/有效及已撤销关系/连通组） |
 | `POST` | `/api/assembly/versions/{v}/gaps` | 陶片对间隙查询：按该版快照计算每对边界最短间隙/最近点/是否重叠（只读） |
+| `POST` | `/api/assembly/versions/{v}/repair-region` | 补配区域评估：组锚 + 世界坐标目标器形轮廓，返回目标/已覆盖/缺口面积与各缺口外边界、内孔边界、面积（只读） |
 | `POST` | `/api/assembly/versions/{v}/restore/preview` | 恢复预览：恢复后完整装配 + 与当前版碎片/关系差异（不落库） |
 | `POST` | `/api/assembly/versions/{v}/restore/confirm` | 确认恢复（原子恢复原 ID 与状态、重算连通组，版本只 +1，留新快照） |
 | `POST` | `/api/trials/rehearse` | 有序试拼预演（不落库） |
@@ -246,10 +275,12 @@ curl -X DELETE 'http://localhost:8000/api/fragments/5?expected_version=2'
 错误约定：`400` 校验拒绝（轮廓自交 / 标记重合 / 标记不在边缘 / 标记数量
 不一致 / 遗漏有效关系 / 误差超限 / 碰撞 / 空序列 / 撤销目标非法 / 目标
 版本即当前版 / **锚点所在组不足两片** / **空陶片对列表 / 无效编号 /
-同片成对 / 重复陶片对 / 跨版本**），`404` 对象不存在（碎片、关系、
-**目标版本快照**、**锚点碎片**缺失；版本恢复时
+同片成对 / 重复陶片对 / 跨版本** / **补配目标轮廓自交或退化 / 非有限
+坐标 / 锚片编号非法**），`404` 对象不存在（碎片、关系、**目标版本
+快照**、**锚点碎片**缺失；版本恢复时
 `detail.code=version_not_found`，校准时 `detail.code=fragment_not_found`，
-**间隙查询时 `detail.code=fragment_not_found` 并逐字段指出缺失陶片**），
+**间隙查询时 `detail.code=fragment_not_found` 并逐字段指出缺失陶片**，
+**补配评估时 `detail.code=anchor_not_found` 并指出锚片字段**），
 `409` 版本冲突或重复撤销（含恢复预览/确认、**校准预览/确认**、**导入确认**的期望版本
 过期），`422` 请求体结构不合法。迁移包本身的结构 / 轮廓 / 引用 / 快照版本
 / 末版一致性问题为 `400`（`detail.code` 见「离线工作站迁移 API」的整包拒绝
@@ -896,23 +927,160 @@ curl -X POST http://localhost:8000/api/assembly/versions/2/gaps \
 #   {"field":"pairs[3].version","code":"cross_version", ...}]}}
 ```
 
+## 补配区域评估 API
+
+修复师在**任一装配版本**中选一片陶片作为**组锚**，并给出**世界坐标
+（毫米制）的目标器形闭合轮廓**，系统评估该片所在连通组的补配区域
+（孤片按单片计算）：
+
+1. 按所选版本快照中每片陶片的**固定轮廓与位姿**放置组内全部陶片；
+2. 每片**先裁入目标范围**（与目标求交），再对全部裁入部分取**几何并集**
+   ——碎片超出目标的部分不计，碎片彼此重叠的部分只扣一次；
+3. 目标减去并集得到缺口；每个**正面积缺口**返回外边界、内孔边界与面积。
+
+**拓扑语义**：
+
+- 目标范围内独立的已覆盖岛 → 缺口多边形保留为**带内孔**的面（孔洞
+  拓扑不丢，内孔边界即覆盖岛轮廓）；
+- **仅共点的缺口不合并**：两片缺口若只在一个点接触，作为两条独立缺口
+  分别返回（按面积降序、再按中心 (x, y) 升序）；
+- 覆盖物仅一点接触目标边界时（如从边界垂下的悬空墙，墙底两侧连通），
+  区域本身连通，按**单一缺口**返回，该覆盖物不是独立岛、不作为内孔；
+- 无正面积缺口时返回空清单与零缺口面积（如目标被完全覆盖）。
+
+**只读保证**：仅读取指定版本的不可改快照，不修改当前装配、关系与历史，
+也不产生新版本快照；当前版与任意历史版均可评估。
+
+### 请求
+
+```
+POST /api/assembly/versions/{version}/repair-region
+```
+
+```jsonc
+{
+  "anchor_fragment_id": 1,                 // 组锚：该版快照中任一片（孤片按单片）
+  "target_contour": [                      // 目标器形闭合轮廓（世界坐标，毫米制）
+    [0, 0], [90, 0], [90, 60], [0, 60]
+  ]
+}
+```
+
+### 调用示例
+
+```bash
+curl -X POST http://localhost:8000/api/assembly/versions/2/repair-region \
+  -H 'Content-Type: application/json' \
+  -d '{"anchor_fragment_id": 1,
+       "target_contour": [[0,0],[90,0],[90,60],[0,60]]}'
+```
+
+响应（面积 mm²，轮廓/中心坐标 mm；缺口按面积降序、中心坐标升序）：
+
+```jsonc
+{
+  "ok": true,
+  "version": 2,
+  "source": "accept",
+  "source_label": "采纳拼接",
+  "snapshot_created_at": "2026-10-06T00:41:27+00:00",
+  "current_version": 3,
+  "historical": true,                    // 评估的是否为历史版本
+  "anchor_fragment_id": 1,
+  "group_fragment_ids": [1, 2],          // 实际参与的连通组（孤片仅 1 个）
+  "independent": false,                  // 锚片是否为孤片
+  "target_contour": [[0.0,0.0], "..."],  // 规范化后的目标轮廓
+  "target_area_mm2": 5400.0,             // 目标面积
+  "covered_area_mm2": 4800.0,            // 已覆盖面积（裁入目标的并集面积）
+  "gap_total_area_mm2": 600.0,           // 缺口总面积 = 目标 - 已覆盖
+  "gap_count": 1,
+  "gaps": [
+    { "index": 1,
+      "area_mm2": 600.0,                 // 该缺口面积（mm²）
+      "centroid": [85.0, 30.0],          // 中心坐标（世界坐标 mm）
+      "exterior": [[90.0,60.0], "..."],  // 外边界闭合环（不含重复末点）
+      "holes": [],                       // 内孔边界列表；无内孔为空
+      "hole_count": 0 }
+  ],
+  "fragments": [                         // 参与评估的组内陶片与各自裁入面积
+    { "fragment_id": 1, "name": "陶片A-左半", "anchor": true,  "clipped_area_mm2": 2137.5 },
+    { "fragment_id": 2, "name": "陶片B-右半", "anchor": false, "clipped_area_mm2": 2662.5 }
+  ]
+}
+```
+
+独立已覆盖岛的响应片段（缺口带 1 个内孔）：
+
+```jsonc
+{
+  "target_area_mm2": 500.0,
+  "covered_area_mm2": 100.0,
+  "gap_total_area_mm2": 400.0,
+  "gap_count": 1,
+  "gaps": [
+    { "index": 1, "area_mm2": 400.0, "centroid": [107.5, 5.0],
+      "exterior": ["...目标外边界..."],
+      "holes": [[[100.0,0.0], [100.0,10.0], [110.0,10.0], [110.0,0.0]]],
+      "hole_count": 1 }
+  ]
+}
+```
+
+目标被完全覆盖时：`"gap_count": 0, "gaps": [], "gap_total_area_mm2": 0.0`。
+
+### 整次拒绝（指出原因，不执行任何计算，不写任何数据）
+
+- `400 invalid_anchor`：`anchor_fragment_id` 不是正整数
+  （`detail.errors[0].field="anchor_fragment_id"`）；
+- `400 self_intersecting_contour`：目标轮廓自交或退化（面积为零 /
+  有效顶点不足 3 个），`detail.errors[]` 指出 `target_contour`
+  （附 GEOS 原因）；顶点不足 3 个的结构性错误为 `422`；
+- `400 non_finite_coordinate`：目标轮廓任一顶点坐标非有限数
+  （NaN / Infinity / -Infinity），`detail.errors[]` 逐点指出
+  `target_contour[i]`；坐标不是数值（如字符串）为 `422`；
+- `404 version_not_found`：目标版本快照不存在；
+- `404 anchor_not_found`：锚片在该版本快照中不存在（可能在该版之后
+  才录入或已删除），`detail.errors[0].field="anchor_fragment_id"`、
+  `detail.anchor_fragment_id` 给出编号。
+
+```bash
+# 非有限坐标：逐点指出
+curl -X POST http://localhost:8000/api/assembly/versions/2/repair-region \
+  -H 'Content-Type: application/json' \
+  -d '{"anchor_fragment_id":1,
+       "target_contour":[[0,0],[90,0],[90,NaN],[0,60]]}'
+# 400 {"detail":{"code":"non_finite_coordinate","errors":[
+#   {"field":"target_contour[2]","code":"non_finite_coordinate",
+#    "message":"第 3 个顶点坐标非有限数（nan, 60.0）：NaN / Infinity 不允许"}]}}
+
+# 锚片在该版本不存在
+curl -X POST http://localhost:8000/api/assembly/versions/1/repair-region \
+  -H 'Content-Type: application/json' \
+  -d '{"anchor_fragment_id":99,
+       "target_contour":[[0,0],[90,0],[90,60],[0,60]]}'
+# 404 {"detail":{"code":"anchor_not_found",
+#   "anchor_fragment_id":99,"version":1,"errors":[...]}}
+```
+
 ## 项目结构
 
 ```
 app/
-  main.py          # FastAPI 路由、单条拼接、版本控制、试拼/修订/校准/历史恢复/间隙查询/离线迁移端点
+  main.py          # FastAPI 路由、单条拼接、版本控制、试拼/修订/校准/历史恢复/间隙查询/补配评估/离线迁移端点
   history.py       # 历史版本：来源标签、连通组重算、碎片/关系差异演算（只读）
   portable.py      # 离线工作站迁移：JSON 包导出、整包校验、导入预览演算（只读）
   revision.py      # 轮廓修订：边缘标记校验、受影响组误差/碰撞演算（只读）
   calibration.py   # 锚点整体校准：固定锚点的组内刚体最小二乘、误差/碰撞演算（只读）
   gaps.py          # 陶片对间隙查询：版本快照上的边界最短间隙/最近点/重叠演算（只读）
+  repair.py        # 补配区域评估：组锚目标范围裁剪/并集/缺口与孔洞拓扑演算（只读）
   trial.py         # 有序试拼：内存快照逐步推演 + 整组提交 + 位姿演算
   geometry.py      # 刚体配准（最小二乘）、轮廓/边缘标记校验、重叠检测
   database.py      # SQLite 持久化、连通组重算、不可改版本快照、按版恢复、迁移包整包导入
   static/          # 浏览器二维画布前端（原生 JS）
 tests/
-  test_gaps.py     # 陶片对间隙查询 API 测试
-  test_transfer.py # 离线工作站迁移（导出/预览/确认/整包拒绝/空白约束/409）测试
+  test_gaps.py          # 陶片对间隙查询 API 测试
+  test_repair_region.py # 补配区域评估 API 测试（面积/孔洞/仅共点不合并/拒绝/只读）
+  test_transfer.py      # 离线工作站迁移（导出/预览/确认/整包拒绝/空白约束/409）测试
 Dockerfile
 docker-compose.yml
 requirements.txt

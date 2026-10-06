@@ -36,6 +36,13 @@
   排序；只读，不因计算改变位姿、关系或历史，也不产生新快照。缺少陶片、
   重复陶片对、跨版本或无效编号时整次拒绝并指出字段。间隙为 0 表示接触，
   负值（-1）仅标识内部重叠，不得当作可用间隙（详见 gaps.py）。
+- 补配区域评估（/api/assembly/versions/{v}/repair-region）：修复师在任一
+  装配版本选一片作组锚并给出世界坐标毫米制目标器形闭合轮廓，系统按该版
+  轮廓与位姿放置锚片所在连通组全部陶片（孤片按单片），先裁入目标范围再
+  取几何并集（超出目标部分不计、重叠只扣一次），目标减去并集得到缺口并
+  保留孔洞拓扑；返回目标/已覆盖/缺口面积与每个正面积缺口的外边界、内孔
+  边界和面积（面积降序、中心坐标升序）。只读，不改装配、关系与快照；
+  目标轮廓自交、锚片该版不存在、坐标非有限数时整次拒绝（详见 repair.py）。
 - 离线工作站迁移（/api/transfer/export、/api/transfer/import/preview|
   confirm）：导出当前装配及全部不可改快照为带格式版本号的 JSON 包
   （只读）；导入先预览包内碎片、有效及已撤销关系、版本数与导入后装配
@@ -59,10 +66,11 @@ from fastapi import FastAPI, HTTPException, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import calibration, gaps, geometry, history, portable, revision, trial
+from . import calibration, gaps, geometry, history, portable, repair, revision, trial
 from .calibration import CalibrationError, evaluate_calibration
 from .database import DB
 from .portable import PackageError
+from .repair import RepairError
 from .revision import RevisionError, evaluate_revision
 from .trial import TrialError, evaluate_proposal
 
@@ -158,6 +166,13 @@ class GapPairIn(BaseModel):
 class GapsIn(BaseModel):
     # 非空陶片对列表；空列表整次拒绝（400 empty_pairs）
     pairs: list[GapPairIn] = Field(default_factory=list)
+
+
+class RepairRegionIn(BaseModel):
+    # 组锚：该版快照中任一片（孤片按单片计算）；必须为正整数
+    anchor_fragment_id: int
+    # 目标器形闭合轮廓（世界坐标、毫米制）；自交 / 非有限坐标整次拒绝
+    target_contour: list[list[float]] = Field(min_length=3)
 
 
 class TransferPreviewIn(BaseModel):
@@ -792,6 +807,41 @@ def query_gaps(version: int, payload: GapsIn):
             "pair_count": len(out),
             "pairs": out,
         }
+
+
+@app.post("/api/assembly/versions/{version}/repair-region")
+def assess_repair_region(version: int, payload: RepairRegionIn):
+    """补配区域评估：在任一装配版本快照上选组锚 + 世界坐标目标器形轮廓，
+    评估锚片所在连通组（孤片按单片）的补配缺口。
+
+    组内全部陶片按该版轮廓与位姿放置，先裁入目标范围再取几何并集（超出
+    目标部分不计、重叠只扣一次）；目标减去并集得到缺口，保留孔洞拓扑；
+    每个正面积缺口返回外边界、内孔边界与面积，按面积降序、中心坐标升序。
+    只读：不改当前装配、关系与快照。目标轮廓自交 / 非有限坐标 → 400；
+    版本快照不存在 → 404 version_not_found；锚片在该版不存在 → 404
+    anchor_not_found；无正面积缺口时 gaps 为空、缺口总面积为 0。
+    """
+    d = get_db()
+    with d.lock:
+        try:
+            anchor_id = repair.validate_anchor_id(payload.anchor_fragment_id)
+            target_pts = repair.validate_target_contour(payload.target_contour)
+        except RepairError as e:
+            raise HTTPException(e.status, e.detail())
+        source, created_at, snap = _load_snapshot(d, version)
+        try:
+            res = repair.assess_repair_region(snap, anchor_id, target_pts)
+        except RepairError as e:
+            raise HTTPException(e.status, e.detail())
+        body = repair.format_result(res)
+        body.update({
+            "source": source,
+            "source_label": history.source_label(source),
+            "snapshot_created_at": created_at,
+            "current_version": d.version(),
+            "historical": version != d.version(),
+        })
+        return body
 
 
 @app.post("/api/assembly/versions/{version}/restore/preview")
